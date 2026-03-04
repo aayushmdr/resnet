@@ -2,9 +2,10 @@ import torch
 from torch.utils.data import Dataset
 import nibabel as nib
 import numpy as np
-import os
 import pandas as pd
 from scipy.ndimage import zoom
+import os
+import gc # Added for memory management
 
 class UterineDataset(Dataset):
     def __init__(self, csv_path, target_shape=(128, 128, 128)):
@@ -14,52 +15,34 @@ class UterineDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
-    def get_bbox_from_contour(self, image, mask):
-        """
-        Takes a contour mask and finds the boundary to crop the image.
-        """
-        # Find all (Z, Y, X) coordinates where the contour exists
+    def get_bbox_crop(self, image, mask):
         coords = np.argwhere(mask > 0)
-        
-        if coords.size == 0:
-            return image # Fallback if mask is empty
-            
-        # Extract the min and max of each axis to form a 'virtual' bounding box
+        if coords.size == 0: return image
         z_min, y_min, x_min = coords.min(axis=0)
         z_max, y_max, x_max = coords.max(axis=0)
-        
-        # Add 10% padding so the model sees the 'edges' of the uterus
-        z_pad = int((z_max - z_min) * 0.1)
-        y_pad = int((y_max - y_min) * 0.1)
-        x_pad = int((x_max - x_min) * 0.1)
-
-        # Apply crop with safety boundaries
-        img_crop = image[
-            max(0, z_min-z_pad) : min(image.shape[0], z_max+z_pad),
-            max(0, y_min-y_pad) : min(image.shape[1], y_max+y_pad),
-            max(0, x_min-x_pad) : min(image.shape[2], x_max+x_pad)
-        ]
-        return img_crop
+        # 5-pixel buffer
+        return image[max(0, z_min-5):z_max+5, max(0, y_min-5):y_max+5, max(0, x_min-5):x_max+5]
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         
-        # 1. Load Image
-        img = nib.load(row['image_path']).get_fdata().astype(np.float32)
+        # Load NIfTI (ensure path is absolute for SSH consistency)
+        img_obj = nib.load(row['image_path'])
+        img_data = img_obj.get_fdata().astype(np.float32)
         
-        # 2. Use Contour Mask for Cropping (if available)
-        mask_path = row['mask_path']
-        if pd.notna(mask_path) and os.path.exists(str(mask_path)):
-            mask = nib.load(mask_path).get_fdata()
-            img = self.get_bbox_from_contour(img, mask)
+        if pd.notna(row['mask_path']) and os.path.exists(str(row['mask_path'])):
+            mask_data = nib.load(row['mask_path']).get_fdata()
+            img_data = self.get_bbox_crop(img_data, mask_data)
+            del mask_data # Free memory immediately
         
-        # 3. Resize to 128x128x128
-        # Using zoom for 3D interpolation
-        factors = [t/s for t, s in zip(self.target_shape, img.shape)]
-        img = zoom(img, factors, order=1)
+        # Resize
+        zoom_factors = [t / s for t, s in zip(self.target_shape, img_data.shape)]
+        img_data = zoom(img_data, zoom_factors, order=1)
         
-        # 4. Normalization
-        img = (img - np.mean(img)) / (np.std(img) + 1e-8)
+        # Normalize
+        img_data = (img_data - np.mean(img_data)) / (np.std(img_data) + 1e-8)
         
-        # 5. Format for PyTorch (1, D, H, W)
-        return torch.FloatTensor(img).unsqueeze(0), torch.tensor(int(row['label']))
+        # Explicitly trigger garbage collection for the large raw objects
+        gc.collect() 
+        
+        return torch.FloatTensor(img_data).unsqueeze(0), torch.tensor(int(row['label']))
